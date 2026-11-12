@@ -539,6 +539,16 @@ class RateLimiterTests {
 	}
 
 	@Test
+	@DisplayName("IPv6: a /60 separates adjacent prefixes without splitting addresses inside one")
+	void testIpv6PrefixIncludesPartialBytes() {
+		RateLimiter limiter = RateLimiter.builder().clock(new TestClock()).ipv6PrefixBits(60).build();
+		RateLimiter.Scope scope = addressScope(1);
+		assertTrue(limiter.checkAddress(scope, "2001:db8:1:1200::1", 1).allowed());
+		assertFalse(limiter.checkAddress(scope, "2001:db8:1:120f::2", 1).allowed());
+		assertTrue(limiter.checkAddress(scope, "2001:db8:1:1210::1", 1).allowed());
+	}
+
+	@Test
 	@DisplayName("IPv6: IPv4 addresses are bucketed whole")
 	void testIpv4AddressesAreNotGrouped() {
 		RateLimiter limiter = limiter();
