@@ -430,11 +430,15 @@ public class RateLimiter implements AutoCloseable {
 				return "v4:" + address;
 			}
 
-			int keepBytes = Math.min(16, Math.max(0, ipv6PrefixBits) / 8);
+			int keepBytes = (ipv6PrefixBits + 7) / 8;
+			int remainder = ipv6PrefixBits % 8;
 			StringBuilder sb = new StringBuilder(3 + keepBytes * 2).append("v6:");
-			for (int i = 0; i < keepBytes; i++)
-				sb.append(Character.forDigit((bytes[i] >> 4) & 0xF, 16))
-						.append(Character.forDigit(bytes[i] & 0xF, 16));
+			for (int i = 0; i < keepBytes; i++) {
+				int value = bytes[i] & 0xFF;
+				if (i == keepBytes - 1 && remainder != 0)
+					value &= 0xFF << (8 - remainder);
+				sb.append(Character.forDigit(value >> 4, 16)).append(Character.forDigit(value & 0xF, 16));
+			}
 
 			return sb.toString();
 		} catch (UnknownHostException e) {
