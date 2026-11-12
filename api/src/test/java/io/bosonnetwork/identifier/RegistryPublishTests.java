@@ -27,14 +27,19 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.util.List;
 import java.util.Optional;
 
 import org.junit.jupiter.api.Test;
 
 import io.bosonnetwork.Id;
 import io.bosonnetwork.Identity;
+import io.bosonnetwork.PeerInfo;
+import io.bosonnetwork.UserProfile;
 import io.bosonnetwork.Value;
 import io.bosonnetwork.crypto.CryptoIdentity;
+import io.bosonnetwork.service.FederatedService;
+import io.bosonnetwork.service.SuperNodeProfile;
 
 /**
  * The card lifecycle an app runs for its user through a registry: publish (the registry choosing the
@@ -75,6 +80,39 @@ public class RegistryPublishTests {
 		assertEquals(0, registry.publish(alice, card("Alice")).get());
 		assertEquals(1, registry.publish(alice, card("Alice B.")).get());
 		assertEquals(1, registry.getPublished(alice.getId()).get().orElseThrow().getVersion());
+	}
+
+	@Test
+	void rotatingANodesKeysDoesNotRewriteItsUsersPublishedCards() throws Exception {
+		Id oldNode = Id.random();
+		Id oldPeer = Id.random();
+		UserProfile original = UserProfile.builder(alice).name("Alice").homeNode(oldNode)
+				.messagingHomePeer(oldPeer).build();
+		assertEquals(0, registry.publish(alice, original.getCard()).get());
+
+		Identity replacementNode = new CryptoIdentity();
+		Identity replacementPeer = new CryptoIdentity();
+		registry.publish(replacementNode, SuperNodeProfile.builder(replacementNode).name("Replacement node")
+				.build().getCard()).get();
+		PeerInfo announcement = PeerInfo.builder().identity(replacementPeer).node(replacementNode)
+				.endpoint("https://replacement.example:8884").build();
+		node.peers.put(replacementPeer.getId(), List.of(announcement));
+		assertEquals(replacementNode.getId(), FederatedService.fromAnnouncements(List.of(announcement))
+				.orElseThrow().nodeId());
+		UserProfile stillOld = UserProfile.fromCard(registry.resolve(alice.getId(), true).get().result().orElseThrow());
+		assertEquals(oldNode, stillOld.getHomeNode().orElseThrow());
+		assertEquals(oldPeer, stillOld.getMessagingHomePeer().orElseThrow());
+
+		UserProfile updated = UserProfile.builder(alice).name("Alice").homeNode(replacementNode.getId())
+				.messagingHomePeer(replacementPeer.getId()).build();
+		assertThrows(IllegalArgumentException.class, () -> registry.publish(replacementNode, updated.getCard()));
+		assertEquals(1, registry.publish(alice, updated.getCard(), 0).get());
+		Registry.ResolutionResult<Card> resolved = registry.resolve(alice.getId(), true).get();
+		UserProfile current = UserProfile.fromCard(resolved.result().orElseThrow());
+		assertEquals(alice.getId(), resolved.result().orElseThrow().getId());
+		assertEquals(1, resolved.getResultMetadata().getVersion());
+		assertEquals(replacementNode.getId(), current.getHomeNode().orElseThrow());
+		assertEquals(replacementPeer.getId(), current.getMessagingHomePeer().orElseThrow());
 	}
 
 	@Test
