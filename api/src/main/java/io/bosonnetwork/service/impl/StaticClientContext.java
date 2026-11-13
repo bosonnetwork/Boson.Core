@@ -29,9 +29,13 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.function.Consumer;
 
 import io.vertx.core.Future;
 import org.jspecify.annotations.Nullable;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import io.bosonnetwork.Id;
 import io.bosonnetwork.Identity;
@@ -39,9 +43,9 @@ import io.bosonnetwork.service.ClientAuthenticator;
 import io.bosonnetwork.service.ClientAuthorizer;
 import io.bosonnetwork.service.ClientContext;
 import io.bosonnetwork.service.ClientDevice;
+import io.bosonnetwork.service.ClientListener;
 import io.bosonnetwork.service.ClientUser;
 import io.bosonnetwork.service.Principal;
-import io.bosonnetwork.utils.Variable;
 import io.bosonnetwork.vertx.ContextualFuture;
 import io.bosonnetwork.web.ClientProvider;
 import io.bosonnetwork.web.CwtAuth;
@@ -56,9 +60,12 @@ import io.bosonnetwork.web.CwtAuthOptions;
  * need long-term storage or dynamic updates from external sources.
  */
 public class StaticClientContext implements ClientContext {
+	private static final Logger log = LoggerFactory.getLogger(StaticClientContext.class);
 	private final Identity nodeIdentity;
 	private final Map<Id, UserAndDevices> userDevicesRegistry;
 	private final Map<Id, Map<String, Object>> userFeatures;
+	private final Object mutationLock = new Object();
+	private final List<ListenerRegistration> listeners = new CopyOnWriteArrayList<>();
 
 	private record UserAndDevices(ClientUser user, List<ClientDevice> devices) {}
 
@@ -90,8 +97,16 @@ public class StaticClientContext implements ClientContext {
 	 */
 	public void setFeatures(Id userId, Map<String, Object> features) {
 		Objects.requireNonNull(userId);
-		Objects.requireNonNull(features);
-		userFeatures.put(userId, Map.copyOf(features));
+		Map<String, Object> copy = Map.copyOf(features);
+		synchronized (mutationLock) {
+			if (copy.equals(getFeatures(userId)))
+				return;
+			if (copy.isEmpty())
+				userFeatures.remove(userId);
+			else
+				userFeatures.put(userId, copy);
+		}
+		fire(listener -> listener.onUserPlanChanged(userId));
 	}
 
 	/**
@@ -108,14 +123,6 @@ public class StaticClientContext implements ClientContext {
 
 	/**
 	 * Adds a new user to the user registry if they do not already exist.
-	 * <p>
-	 * <strong>Concurrency note:</strong> the up-front existence check and the
-	 * {@code computeIfAbsent} insert are not a single atomic step. Two threads calling
-	 * {@code addUser(sameId, ...)} concurrently can both observe "not present" and both return
-	 * {@code true}; the {@code computeIfAbsent} call still atomizes the actual writing, so only one
-	 * {@link PlainUser} entry is inserted - the race is benign with respect to map state but the
-	 * boolean return may over-report success. This is a test/bring-up helper; this trade-off is
-	 * acceptable for that use.
 	 *
 	 * @param userId    The unique identifier of the user to be added. Must not be null.
 	 * @param name      The name of the user to be added.
@@ -124,10 +131,32 @@ public class StaticClientContext implements ClientContext {
 	 */
 	public boolean addUser(Id userId, String name) {
 		Objects.requireNonNull(userId);
-		if (existsUserSync(userId))
-			return false;
+		synchronized (mutationLock) {
+			if (existsUserSync(userId))
+				return false;
+			userDevicesRegistry.put(userId, new UserAndDevices(new PlainUser(userId, name, null, null, null), List.of()));
+		}
+		fire(listener -> listener.onUserUpdated(userId));
+		return true;
+	}
 
-		userDevicesRegistry.computeIfAbsent(userId, k -> new UserAndDevices(new PlainUser(userId, name, null, null, null), List.of()));
+	/**
+	 * Replaces an existing user's snapshot and reports a user update, retaining its devices/features.
+	 * Callers must not mutate a snapshot after handing it to this context.
+	 *
+	 * @param user the replacement snapshot
+	 * @return false if the user is absent or the supplied snapshot equals the current one
+	 */
+	public boolean updateUser(ClientUser user) {
+		Objects.requireNonNull(user);
+		Id userId = Objects.requireNonNull(user.getId());
+		synchronized (mutationLock) {
+			UserAndDevices previous = userDevicesRegistry.get(userId);
+			if (previous == null || previous.user().equals(user))
+				return false;
+			userDevicesRegistry.put(userId, new UserAndDevices(user, previous.devices()));
+		}
+		fire(listener -> listener.onUserUpdated(userId));
 		return true;
 	}
 
@@ -168,18 +197,19 @@ public class StaticClientContext implements ClientContext {
 	 */
 	public boolean removeUser(Id userId) {
 		Objects.requireNonNull(userId);
-		return userDevicesRegistry.remove(userId) != null;
+		synchronized (mutationLock) {
+			if (userDevicesRegistry.remove(userId) == null)
+				return false;
+			userFeatures.remove(userId);
+		}
+		// This one notification includes the user's devices and plan state.
+		fire(listener -> listener.onUserRemoved(userId));
+		return true;
 	}
 
 	/**
 	 * Adds a new device to the user registry for a specified user. If the device already exists
 	 * globally, the addition will fail and return false. The user must already exist in the registry.
-	 * <p>
-	 * <strong>Concurrency note:</strong> as with {@link #addUser(Id, String) addUser},
-	 * the up-front {@code existsDeviceSync} check and the subsequent {@code compute} insert are
-	 * not a single atomic step; concurrent {@code addDevice} calls for the same {@code deviceId}
-	 * can both return {@code true} even though only one entry is actually inserted. The race is
-	 * benign with respect to map state and acceptable for this test/bring-up helper.
 	 *
 	 * @param userId The unique identifier of the user to which the device will be added. Must not be null.
 	 * @param deviceId The global unique identifier of the device to be added. Must not be null.
@@ -188,32 +218,54 @@ public class StaticClientContext implements ClientContext {
 	 * @return true if the device was successfully added, false if the device already exists.
 	 * @throws NullPointerException if userId or deviceId is null.
 	 * @throws IllegalArgumentException if the user does not exist in the registry.
-	 * @throws IllegalStateException if the user exists with no valid registry state.
 	 */
 	public boolean addDevice(Id userId, Id deviceId, String deviceName, String app) {
 		Objects.requireNonNull(userId);
 		Objects.requireNonNull(deviceId);
-		if (!existsUserSync(userId))
-			throw new IllegalArgumentException("User does not exist");
+		synchronized (mutationLock) {
+			UserAndDevices previous = userDevicesRegistry.get(userId);
+			if (previous == null)
+				throw new IllegalArgumentException("User does not exist");
+			// Device IDs are globally unique, including across concurrent fixture mutations.
+			if (existsDeviceSync(deviceId))
+				return false;
+			List<ClientDevice> devices = new ArrayList<>(previous.devices());
+			devices.add(new PlainDevice(deviceId, userId, deviceName, app));
+			userDevicesRegistry.put(userId, new UserAndDevices(previous.user(), List.copyOf(devices)));
+		}
+		fire(listener -> listener.onDeviceUpdated(userId, deviceId));
+		return true;
+	}
 
-		// device id should be globally unique
-		if (existsDeviceSync(deviceId))
-			return false;
-
-		userDevicesRegistry.compute(userId, (k, v) -> {
-			if (v == null)
-				throw new IllegalStateException("User does not exist");
-
-			ClientDevice newDevice = new PlainDevice(deviceId, userId, deviceName, app);
-			if (v.devices.isEmpty()) {
-				return new UserAndDevices(v.user, List.of(newDevice));
-			} else {
-				List<ClientDevice> devices = new ArrayList<>(v.devices);
-				devices.add(newDevice);
-				return new UserAndDevices(v.user, List.copyOf(devices));
+	/**
+	 * Replaces an existing device's snapshot and reports a device update. Ownership cannot change.
+	 * Callers must not mutate a snapshot after handing it to this context.
+	 *
+	 * @param device the replacement snapshot
+	 * @return false if the device is absent from this user or equals its current snapshot
+	 */
+	public boolean updateDevice(ClientDevice device) {
+		Objects.requireNonNull(device);
+		Id userId = Objects.requireNonNull(device.getUserId());
+		Id deviceId = Objects.requireNonNull(device.getId());
+		synchronized (mutationLock) {
+			UserAndDevices previous = userDevicesRegistry.get(userId);
+			if (previous == null)
+				return false;
+			List<ClientDevice> devices = new ArrayList<>(previous.devices());
+			int index = -1;
+			for (int i = 0; i < devices.size(); i++) {
+				if (devices.get(i).getId().equals(deviceId)) {
+					index = i;
+					break;
+				}
 			}
-		});
-
+			if (index < 0 || devices.get(index).equals(device))
+				return false;
+			devices.set(index, device);
+			userDevicesRegistry.put(userId, new UserAndDevices(previous.user(), List.copyOf(devices)));
+		}
+		fire(listener -> listener.onDeviceUpdated(userId, deviceId));
 		return true;
 	}
 
@@ -310,33 +362,68 @@ public class StaticClientContext implements ClientContext {
 		Objects.requireNonNull(userId);
 		Objects.requireNonNull(deviceId);
 
-		Variable<Boolean> removed = Variable.of(false);
-		userDevicesRegistry.computeIfPresent(userId, (k, v) -> {
-			if (v.devices.isEmpty())
-				return v;
-
-			List<ClientDevice> devices = new ArrayList<>(v.devices);
-			boolean rm = devices.removeIf(d -> d.getId().equals(deviceId));
-			if (rm) {
-				removed.set(true);
-				return new UserAndDevices(v.user, List.copyOf(devices));
-			} else {
-				// no change
-				return v;
-			}
-		});
-
-		return removed.get();
+		synchronized (mutationLock) {
+			UserAndDevices previous = userDevicesRegistry.get(userId);
+			if (previous == null)
+				return false;
+			List<ClientDevice> devices = new ArrayList<>(previous.devices());
+			if (!devices.removeIf(d -> d.getId().equals(deviceId)))
+				return false;
+			userDevicesRegistry.put(userId, new UserAndDevices(previous.user(), List.copyOf(devices)));
+		}
+		fire(listener -> listener.onDeviceRemoved(userId, deviceId));
+		return true;
 	}
 
 	/**
 	 * Clears all entries from the user device registry.
 	 * This method removes all registered devices associated with users,
-	 * effectively resetting the registry to an empty state.
+	 * effectively resetting the registry to an empty state. Reports one user removal per registered
+	 * user, plus a user-plan change for features preconfigured for an unregistered user. Listeners
+	 * remain registered, and all state is cleared before any callback runs.
 	 */
 	public void clear() {
-		userDevicesRegistry.clear();
-		userFeatures.clear();
+		List<Id> removedUsers;
+		List<Id> clearedFeatures;
+		synchronized (mutationLock) {
+			removedUsers = List.copyOf(userDevicesRegistry.keySet());
+			clearedFeatures = userFeatures.keySet().stream().filter(id -> !userDevicesRegistry.containsKey(id)).toList();
+			userDevicesRegistry.clear();
+			userFeatures.clear();
+		}
+		removedUsers.forEach(id -> fire(listener -> listener.onUserRemoved(id)));
+		clearedFeatures.forEach(id -> fire(listener -> listener.onUserPlanChanged(id)));
+	}
+
+	@Override
+	public Subscription onChange(ClientListener listener) {
+		ListenerRegistration registration = new ListenerRegistration(Objects.requireNonNull(listener, "listener"));
+		listeners.add(registration);
+		return registration;
+	}
+
+	private void fire(Consumer<ClientListener> notification) {
+		for (ListenerRegistration registration : listeners) {
+			try {
+				notification.accept(registration.listener);
+			} catch (RuntimeException e) {
+				log.error("Client change listener failed", e);
+			}
+		}
+	}
+
+	// Object identity keeps repeated registrations of one listener independent.
+	private final class ListenerRegistration implements Subscription {
+		private final ClientListener listener;
+
+		private ListenerRegistration(ClientListener listener) {
+			this.listener = listener;
+		}
+
+		@Override
+		public void close() {
+			listeners.remove(this);
+		}
 	}
 
 	@Override

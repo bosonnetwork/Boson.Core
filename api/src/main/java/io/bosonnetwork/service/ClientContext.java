@@ -32,13 +32,39 @@ import io.bosonnetwork.service.impl.StaticClientContext;
 import io.bosonnetwork.web.CwtAuth;
 
 /**
- * Client manager interface (Read-only) for the Boson Super Node services.
+ * Client queries, authentication and change notifications for the Boson Super Node services.
  * <p>
  * This interface provides methods to query information about client users and their associated devices
  * registered within the network. It allows retrieving user details, checking for user existence,
  * and listing or verifying devices associated with users.
  */
 public interface ClientContext {
+	/** A registered change listener; closing it removes only that registration. */
+	interface Subscription extends AutoCloseable {
+		/** Removes the registration. Idempotent. */
+		@Override
+		void close();
+	}
+
+	/**
+	 * Registers a listener for user/device updates, removals and changes to plan entitlements.
+	 * Changes are reported after successful mutations and cache updates. An update also covers
+	 * creation; routine last-seen/address touches are excluded. A user removal includes its devices.
+	 * Each callback identifies what to invalidate; query the context or authorizer for current state.
+	 * Override only the {@link ClientListener} methods the service needs. Shared plan changes are
+	 * filtered by the host for this service before {@link ClientListener#onPlansChanged()} is called.
+	 * <p>
+	 * The listener may be called on an arbitrary thread and must neither block nor throw. A service
+	 * with an event loop should hand notifications to it and serialize asynchronous handling there. No
+	 * initial snapshot, replay, total ordering between concurrent mutations or acknowledgment of
+	 * service cleanup is provided. Closing a registration does not cancel a callback already in flight
+	 * or queued by the service; guard startup/shutdown and reconcile persistent resources separately.
+	 *
+	 * @param listener the listener, not null
+	 * @return the subscription; close it to remove this registration
+	 */
+	Subscription onChange(ClientListener listener);
+
 	/**
 	 * Retrieves the user information for a given user ID.
 	 *
