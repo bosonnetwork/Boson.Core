@@ -23,6 +23,7 @@
 package io.bosonnetwork.service.impl;
 
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 
@@ -35,6 +36,7 @@ import io.bosonnetwork.service.ClientAuthenticator;
 import io.bosonnetwork.service.ClientAuthorizer;
 import io.bosonnetwork.service.ClientContext;
 import io.bosonnetwork.service.ClientDevice;
+import io.bosonnetwork.service.ClientListener;
 import io.bosonnetwork.service.ClientUser;
 import io.bosonnetwork.service.Principal;
 import io.bosonnetwork.vertx.ContextualFuture;
@@ -70,6 +72,13 @@ public class AllowAllClientContext implements ClientContext {
 	 */
 	public AllowAllClientContext(Identity nodeIdentity) {
 		this.nodeIdentity = nodeIdentity;
+	}
+
+	@Override
+	public Subscription onChange(ClientListener listener) {
+		Objects.requireNonNull(listener, "listener");
+		// This context's admission and entitlements never change.
+		return () -> {};
 	}
 
 	@Override
