@@ -45,8 +45,12 @@ import io.vertx.junit5.Timeout;
 import io.vertx.junit5.VertxExtension;
 import io.vertx.junit5.VertxTestContext;
 
+import io.bosonnetwork.Id;
 import io.bosonnetwork.NodeInfo;
+import io.bosonnetwork.Value;
 import io.bosonnetwork.crypto.CryptoIdentity;
+import io.bosonnetwork.crypto.Random;
+import io.bosonnetwork.kademlia.exceptions.MessageTooBigException;
 import io.bosonnetwork.kademlia.impl.KadContext;
 import io.bosonnetwork.kademlia.impl.Network;
 import io.bosonnetwork.kademlia.impl.TestKadContext;
@@ -442,6 +446,47 @@ public class RpcServerOutboundThrottleTests {
 				int parked = server.delayedCallCount();
 				context.verify(() -> assertEquals(0, parked,
 						"cancelled pre-write calls must refund outbound throttle capacity"));
+				return server.stop();
+			}).onComplete(context.succeedingThenComplete());
+		}).onFailure(context::failNow));
+	}
+
+	/**
+	 * If encoding fails (e.g., an oversized request) after the call was admitted and cancelled, the
+	 * outbound-throttle charge must still be refunded while preserving the original encode error.
+	 */
+	@Test
+	@Timeout(value = 30, timeUnit = TimeUnit.SECONDS)
+	void testCancelWithEncodeFailureRefundsOutboundThrottleCapacity(Vertx vertx, VertxTestContext context) {
+		Context vertxContext = vertx.getOrCreateContext();
+		RpcServer server = newServer(vertxContext, 39212);
+		NodeInfo target = deadTarget(39302);
+		Value oversized = Value.of(Id.random(), Random.randomBytes(2048));
+
+		vertxContext.runOnContext(unused -> server.start().onSuccess(v -> {
+			List<Future<RpcCall>> failedSends = new ArrayList<>(OUTBOUND_BURST);
+			List<RpcCall> calls = new ArrayList<>(OUTBOUND_BURST);
+			for (int i = 0; i < OUTBOUND_BURST; i++) {
+				RpcCall call = new RpcCall(target, Message.storeValueRequest(oversized, 1, -1));
+				calls.add(call);
+				failedSends.add(server.sendCall(call));
+				call.cancel();
+			}
+
+			Future.join(failedSends).transform(ignored -> {
+				for (int i = 0; i < OUTBOUND_BURST; i++)
+					server.sendCall(callTo(target));
+
+				int parked = server.delayedCallCount();
+				context.verify(() -> {
+					for (int i = 0; i < OUTBOUND_BURST; i++) {
+						assertTrue(failedSends.get(i).failed(), "encode error must be preserved on the future");
+						assertInstanceOf(MessageTooBigException.class, failedSends.get(i).cause());
+						assertEquals(RpcCall.State.CANCELED, calls.get(i).getState());
+					}
+					assertEquals(0, parked,
+							"encode failure after cancellation must still refund outbound throttle capacity");
+				});
 				return server.stop();
 			}).onComplete(context.succeedingThenComplete());
 		}).onFailure(context::failNow));
