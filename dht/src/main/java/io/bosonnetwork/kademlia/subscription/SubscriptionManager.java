@@ -257,7 +257,9 @@ public class SubscriptionManager {
 		boolean peersDeferred;
 
 		boolean inFlight;
-		long inFlightSince;
+		// When the call actually left the socket (State.SENT); -1 while parked behind the outbound throttle.
+		long inFlightSince = -1;
+		RpcCall inFlightCall;
 		// Bumped when a push in flight is abandoned; its outcome, when it arrives, is ignored.
 		int generation;
 		boolean stalled;
@@ -441,10 +443,7 @@ public class SubscriptionManager {
 				log.debug("{} subscription to {} from {} moved {} -> {}", kind, target, subscriber, sub.address, address);
 				// A push in flight went to where the subscriber no longer is, and would only time out. Abandon
 				// it and push again at once, rather than wait out the timeout for an answer that cannot come.
-				if (sub.inFlight) {
-					sub.generation++;
-					sub.inFlight = false;
-				}
+				abandonInFlight(sub);
 			}
 
 			sub.address = address;
@@ -562,14 +561,13 @@ public class SubscriptionManager {
 				sub.stalled = false;
 				sub.failures = 0;
 				schedule(sub);
-			} else if (sub.inFlight && (sub.failures > 0 || host.now() - sub.inFlightSince >= RESEND_WHEN_HEARD_AFTER)) {
-				// A push still unanswered while the subscriber is plainly reachable was most likely sent into
-				// the gap - before its packet reopened the mapping. Resend now the path is open, rather than
-				// wait out the call timeout; a duplicate is dropped at the subscriber.
+			} else if (sub.inFlight && sub.inFlightSince >= 0 && host.now() - sub.inFlightSince >= RESEND_WHEN_HEARD_AFTER) {
+				// A push still unanswered after leaving the socket while the subscriber is plainly reachable
+				// was most likely sent into the gap - before its packet reopened the mapping. Resend now the
+				// path is open, rather than wait out the call timeout; a duplicate is dropped at the subscriber.
 				log.debug("{} subscription to {} from {}: resending the push in flight, the path is open again",
 						sub.key.kind(), sub.key.target(), nodeId);
-				sub.generation++;
-				sub.inFlight = false;
+				abandonInFlight(sub);
 				schedule(sub);
 			}
 		}
@@ -592,7 +590,10 @@ public class SubscriptionManager {
 	 * Drops every subscription, for when the owning DHT stops.
 	 */
 	public void clear() {
-		subscriptions.values().forEach(s -> s.removed = true);
+		for (Subscription sub : subscriptions.values()) {
+			sub.removed = true;
+			abandonInFlight(sub);
+		}
 		subscriptions.clear();
 		byTopic.clear();
 		bySubscriber.clear();
@@ -627,11 +628,25 @@ public class SubscriptionManager {
 		return subscriptions.get(new Key(subscriber, kind, target));
 	}
 
+	private static void abandonInFlight(Subscription sub) {
+		if (!sub.inFlight)
+			return;
+
+		sub.generation++;
+		sub.inFlight = false;
+		sub.inFlightSince = -1;
+		RpcCall call = sub.inFlightCall;
+		sub.inFlightCall = null;
+		if (call != null)
+			call.cancel();
+	}
+
 	private void remove(Subscription sub) {
 		if (sub.removed)
 			return;
 
 		sub.removed = true;
+		abandonInFlight(sub);
 		subscriptions.remove(sub.key);
 		Set<Subscription> subs = byTopic.get(sub.topic);
 		if (subs != null) {
@@ -827,7 +842,7 @@ public class SubscriptionManager {
 		}
 
 		sub.inFlight = true;
-		sub.inFlightSince = now;
+		sub.inFlightSince = -1;
 		InetSocketAddress to = sub.address;
 		int generation = sub.generation;
 		log.debug("Pushing {} of {} to {}@{}", describe(record), sub.key.target(), sub.key.subscriber(), to);
@@ -840,6 +855,8 @@ public class SubscriptionManager {
 				.addListener(new RpcCallListener() {
 					@Override
 					public void onStateChange(RpcCall c, RpcCall.State previous, RpcCall.State state) {
+						if (state == RpcCall.State.SENT && !settled[0] && sub.generation == generation)
+							sub.inFlightSince = host.now();
 					}
 
 					@Override
@@ -868,6 +885,8 @@ public class SubscriptionManager {
 							log.debug("{} has no {} subscription to {} any more, dropping it", sub.key.subscriber(),
 									sub.key.kind(), sub.key.target());
 							sub.inFlight = false;
+							sub.inFlightSince = -1;
+							sub.inFlightCall = null;
 							remove(sub);
 						} else if (c.getCause() instanceof MessageTooBigException) {
 							undeliverable(sub, record);
@@ -884,11 +903,14 @@ public class SubscriptionManager {
 							settled[0] = true;
 							// Cancelled on our side - a stop - which says nothing about the subscriber.
 							sub.inFlight = false;
+							sub.inFlightSince = -1;
+							sub.inFlightCall = null;
 							schedule(sub);
 						}
 					}
 				});
 
+		sub.inFlightCall = call;
 		host.send(call).onSuccess(c -> pauseBackoff = PAUSE_MIN).onFailure(e -> {
 			if (!settled[0] && sub.generation == generation) {
 				settled[0] = true;
@@ -928,6 +950,8 @@ public class SubscriptionManager {
 	 */
 	private void refused(Subscription sub, Object record, long previousStamp, CallRejectedException.Reason reason) {
 		sub.inFlight = false;
+		sub.inFlightSince = -1;
+		sub.inFlightCall = null;
 		limiter.refund();
 		if (record instanceof Value)
 			sub.valuePushedAt = previousStamp;
@@ -975,6 +999,8 @@ public class SubscriptionManager {
 	 */
 	private void undeliverable(Subscription sub, Object record) {
 		sub.inFlight = false;
+		sub.inFlightSince = -1;
+		sub.inFlightCall = null;
 		if (sub.removed)
 			return;
 
@@ -1004,6 +1030,8 @@ public class SubscriptionManager {
 	private void acknowledged(Subscription sub, Object record) {
 		log.debug("{} of {} acknowledged by {}", describe(record), sub.key.target(), sub.key.subscriber());
 		sub.inFlight = false;
+		sub.inFlightSince = -1;
+		sub.inFlightCall = null;
 		sub.failures = 0;
 		if (record instanceof Value value) {
 			sub.ackedSeq = Math.max(sub.ackedSeq, value.getSequenceNumber());
@@ -1042,6 +1070,8 @@ public class SubscriptionManager {
 
 	private void failed(Subscription sub, InetSocketAddress to, String reason) {
 		sub.inFlight = false;
+		sub.inFlightSince = -1;
+		sub.inFlightCall = null;
 		if (sub.removed)
 			return;
 

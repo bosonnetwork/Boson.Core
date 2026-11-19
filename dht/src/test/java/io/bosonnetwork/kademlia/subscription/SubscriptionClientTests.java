@@ -563,4 +563,212 @@ class SubscriptionClientTests {
 		assertEquals(88, body(subscribes().get(2)).getToken());
 		assertEquals(lookupsBefore, lookups);
 	}
+
+	@Test
+	void testRehomingIgnoresNodesThatDoNotSupportSubscriptions() {
+		int preSub = Version.build("OR", 1);
+		for (int i = 1; i <= 4; i++)
+			candidates.add(candidate("12.1.1." + i, 10 + i, preSub));
+		List<SubscriptionClient.Candidate> capable = new ArrayList<>();
+		for (int i = 5; i <= 8; i++) {
+			SubscriptionClient.Candidate c = candidate("12.1.1." + i, 10 + i);
+			candidates.add(c);
+			capable.add(c);
+		}
+
+		SubscriptionClient.Watch watch = client.subscribe(SubscriptionKind.VALUE, Id.random(), -1, sink);
+		subscribes().forEach(c -> accept(c, 1, 600));
+		Set<Id> expected = capable.stream().map(c -> c.node().getId()).collect(Collectors.toSet());
+		assertEquals(expected, watch.nodes());
+		statuses.clear();
+
+		// Drive renewals up to and through rehome: the closer OR/1 nodes must not evict the OR/2+ slots.
+		for (long t = 0; t < SubscriptionClient.REHOME_INTERVAL; t += SubscriptionClient.RENEW_INTERVAL) {
+			advance(Math.min(SubscriptionClient.RENEW_INTERVAL, SubscriptionClient.REHOME_INTERVAL - t));
+			subscribes().stream().filter(c -> c.getState() == RpcCall.State.UNSENT && !body(c).isCancel())
+					.forEach(c -> accept(c, 1, 600));
+		}
+
+		assertEquals(expected, watch.nodes());
+		assertTrue(subscribes().stream().noneMatch(c -> body(c).isCancel()),
+				"capable nodes must not be cancelled in favour of nodes that cannot hold subscriptions");
+		assertTrue(statuses.isEmpty(), "subscription count must not dip during rehome");
+	}
+
+	@Test
+	void testRehomingPurgesExpiredExclusionsBeforeChoosingWanted() {
+		SubscriptionClient.Candidate closer = candidate("12.1.1.1", 11);
+		candidates.add(closer);
+		for (int i = 2; i <= 5; i++)
+			candidates.add(candidate("12.1.1." + i, 10 + i));
+
+		SubscriptionClient.Watch watch = client.subscribe(SubscriptionKind.VALUE, Id.random(), -1, sink);
+		// The closest node fails once and is excluded for EXCLUDE_FAILED (5 min), so the 5th takes its place.
+		timeout(subscribesTo(closer.node().getId()).get(0));
+		subscribes().stream().filter(c -> c.getState() == RpcCall.State.UNSENT && !body(c).isCancel())
+				.forEach(c -> accept(c, 1, 600));
+		assertFalse(watch.nodes().contains(closer.node().getId()));
+
+		// By REHOME_INTERVAL (15 min), closer's exclusion has expired and rehome should move back to it.
+		for (long t = 0; t < SubscriptionClient.REHOME_INTERVAL; t += SubscriptionClient.RENEW_INTERVAL) {
+			advance(Math.min(SubscriptionClient.RENEW_INTERVAL, SubscriptionClient.REHOME_INTERVAL - t));
+			subscribes().stream().filter(c -> c.getState() == RpcCall.State.UNSENT && !body(c).isCancel())
+					.forEach(c -> accept(c, 1, 600));
+		}
+
+		assertTrue(watch.nodes().contains(closer.node().getId()),
+				"rehome should purge expired exclusions before picking wanted nodes");
+		assertEquals(4, watch.nodes().size());
+	}
+
+	@Test
+	void testRetokenCancelsRenewalAndStaysGuardedThroughReplacementSubscribe() {
+		SubscriptionClient.Candidate a = candidate("12.1.1.1", 11);
+		candidates.add(a);
+		SubscriptionClient.Watch watch = client.subscribe(SubscriptionKind.VALUE, Id.random(), -1, sink);
+		InetSocketAddress before = new InetSocketAddress("12.9.9.9", 40000);
+		InetSocketAddress moved = new InetSocketAddress("12.9.9.9", 40001);
+		InetSocketAddress movedAgain = new InetSocketAddress("12.9.9.9", 40002);
+		acceptAt(subscribes().get(0), 5, before);
+
+		// Rebinding detected just before the renewal timer would fire.
+		advance(SubscriptionClient.RENEW_INTERVAL - SubscriptionClient.NAT_KEEPALIVE_INTERVAL);
+		List<RpcCall> pings = calls(Message.Method.PING);
+		pong(pings.get(pings.size() - 1), moved);
+		assertEquals(1, calls(Message.Method.FIND_NODE).size());
+
+		// Advancing past the original renewal deadline while FIND_NODE is in flight must not send a stale renewal.
+		advance(SubscriptionClient.NAT_KEEPALIVE_INTERVAL);
+		assertEquals(1, subscribes().size(), "renewal timer must be cancelled when retokening starts");
+
+		// FIND_NODE succeeds and sends the replacement SUBSCRIBE; stay guarded until SUBSCRIBE is accepted.
+		tokenReply(calls(Message.Method.FIND_NODE).get(0), 77);
+		assertEquals(2, subscribes().size());
+		assertEquals(77, body(subscribes().get(1)).getToken());
+
+		// A keepalive reply arriving while the replacement SUBSCRIBE is still in flight must not overlap.
+		List<RpcCall> pingsAfterToken = calls(Message.Method.PING);
+		pong(pingsAfterToken.get(pingsAfterToken.size() - 1), moved);
+		assertEquals(1, calls(Message.Method.FIND_NODE).size(),
+				"retoken guard must hold until the replacement SUBSCRIBE settles");
+
+		// Once the replacement SUBSCRIBE is accepted, slot.observed updates and the guard clears.
+		acceptAt(subscribes().get(1), 88, moved);
+		advance(SubscriptionClient.NAT_KEEPALIVE_INTERVAL);
+		List<RpcCall> pingsAfterAccept = calls(Message.Method.PING);
+		pong(pingsAfterAccept.get(pingsAfterAccept.size() - 1), moved);
+		assertEquals(1, calls(Message.Method.FIND_NODE).size(), "same endpoint after acceptance needs no retoken");
+
+		advance(SubscriptionClient.NAT_KEEPALIVE_INTERVAL);
+		List<RpcCall> pingsAfterSecondMove = calls(Message.Method.PING);
+		pong(pingsAfterSecondMove.get(pingsAfterSecondMove.size() - 1), movedAgain);
+		assertEquals(2, calls(Message.Method.FIND_NODE).size(), "guard cleared so a later rebinding retokens");
+		assertTrue(watch.nodes().contains(a.node().getId()));
+	}
+
+	@Test
+	void testInvalidTokenOnReplacementSubscribeDoesNotLoop() {
+		SubscriptionClient.Candidate a = candidate("12.1.1.1", 11);
+		candidates.add(a);
+		SubscriptionClient.Watch watch = client.subscribe(SubscriptionKind.VALUE, Id.random(), -1, sink);
+		InetSocketAddress before = new InetSocketAddress("12.9.9.9", 40000);
+		acceptAt(subscribes().get(0), 5, before);
+
+		advance(SubscriptionClient.NAT_KEEPALIVE_INTERVAL);
+		pong(calls(Message.Method.PING).get(0), new InetSocketAddress("12.9.9.9", 40001));
+		assertEquals(1, calls(Message.Method.FIND_NODE).size());
+
+		tokenReply(calls(Message.Method.FIND_NODE).get(0), 77);
+		assertEquals(2, subscribes().size());
+
+		// Replacement SUBSCRIBE itself fails with InvalidTokenException: must not start another FIND_NODE loop.
+		invoke(subscribes().get(1), "fail", Throwable.class, new InvalidTokenException("still moved"));
+		assertEquals(1, calls(Message.Method.FIND_NODE).size(),
+				"replacement SUBSCRIBE failing with InvalidTokenException must not loop retoken");
+		assertFalse(watch.nodes().contains(a.node().getId()), "slot is dropped so lookup can reacquire cleanly");
+	}
+
+	@Test
+	void testSupersededRenewalCallbackDoesNotDropRepairedSlot() {
+		SubscriptionClient.Candidate a = candidate("12.1.1.1", 11);
+		candidates.add(a);
+		SubscriptionClient.Watch watch = client.subscribe(SubscriptionKind.VALUE, Id.random(), -1, sink);
+		InetSocketAddress before = new InetSocketAddress("12.9.9.9", 40000);
+		InetSocketAddress moved = new InetSocketAddress("12.9.9.9", 40001);
+		acceptAt(subscribes().get(0), 5, before);
+
+		// Renewal fires and is in flight.
+		advance(SubscriptionClient.RENEW_INTERVAL);
+		RpcCall staleRenewal = subscribes().get(1);
+		assertEquals(5, body(staleRenewal).getToken());
+
+		// Keepalive detects a NAT rebinding while the renewal is still in flight.
+		List<RpcCall> pings = calls(Message.Method.PING);
+		pong(pings.get(pings.size() - 1), moved);
+		assertEquals(RpcCall.State.CANCELED, staleRenewal.getState(), "retoken retires the in-flight renewal");
+		assertEquals(1, calls(Message.Method.FIND_NODE).size());
+
+		// Replacement SUBSCRIBE succeeds and repairs the slot at the new endpoint.
+		tokenReply(calls(Message.Method.FIND_NODE).get(0), 77);
+		RpcCall replacement = subscribes().get(2);
+		acceptAt(replacement, 88, moved);
+		assertEquals(1, watch.subscribedNodes());
+
+		// Even if a late timeout or reply callback fired on the superseded renewal, it must be ignored.
+		timeout(staleRenewal);
+		assertEquals(1, watch.subscribedNodes(), "late timeout from superseded renewal must not drop repaired slot");
+		assertTrue(watch.nodes().contains(a.node().getId()));
+
+		// A later keepalive at the repaired endpoint must not think slot.observed reverted.
+		acceptAt(staleRenewal, 9, before);
+		advance(SubscriptionClient.NAT_KEEPALIVE_INTERVAL);
+		List<RpcCall> pingsAfter = calls(Message.Method.PING);
+		pong(pingsAfter.get(pingsAfter.size() - 1), moved);
+		assertEquals(1, calls(Message.Method.FIND_NODE).size());
+	}
+
+	@Test
+	void testRejectedReplacementTokenBringsForwardBackedOffLookup() {
+		SubscriptionClient.Candidate a = candidate("12.1.1.1", 11);
+		candidates.add(a);
+		SubscriptionClient.Watch watch = client.subscribe(SubscriptionKind.VALUE, Id.random(), -1, sink);
+		InetSocketAddress before = new InetSocketAddress("12.9.9.9", 40000);
+		InetSocketAddress moved = new InetSocketAddress("12.9.9.9", 40001);
+		acceptAt(subscribes().get(0), 5, before);
+
+		// Underfilled watch backs off retryLater over several rounds (past 2 minutes), renewing a along the way.
+		for (int i = 0; i < 6; i++) {
+			advance(SubscriptionClient.RENEW_INTERVAL);
+			subscribes().stream().filter(c -> c.getState() == RpcCall.State.UNSENT && !body(c).isCancel())
+					.forEach(c -> acceptAt(c, 5, before));
+		}
+
+		// Ensure at least RELOOKUP_MIN_INTERVAL has elapsed since the last lookup, with a distant retry timer armed.
+		advance(SubscriptionClient.RELOOKUP_MIN_INTERVAL);
+		int lookupsBefore = lookups;
+
+		List<RpcCall> pings = calls(Message.Method.PING);
+		pong(pings.get(pings.size() - 1), moved);
+		List<RpcCall> tokenReqs = calls(Message.Method.FIND_NODE);
+		tokenReply(tokenReqs.get(tokenReqs.size() - 1), 77);
+		RpcCall replacement = subscribes().get(subscribes().size() - 1);
+
+		// Replacement SUBSCRIBE fails with InvalidTokenException: recovery lookup must run promptly,
+		// not wait minutes for the backed-off underfill timer.
+		invoke(replacement, "fail", Throwable.class, new InvalidTokenException("still moved"));
+		assertEquals(lookupsBefore + 1, lookups,
+				"requestLookup must bring forward a backed-off retry timer once the rate limit allows");
+		assertTrue(watch.nodes().contains(a.node().getId()), "lookup reacquired the storing node immediately");
+
+		// Also verify the 30-second rate limit is still respected when a second drop happens immediately.
+		RpcCall reacquired = subscribes().get(subscribes().size() - 1);
+		int lookupsAfterFirst = lookups;
+		invoke(reacquired, "fail", Throwable.class, new InvalidTokenException("rate limited"));
+		assertEquals(lookupsAfterFirst, lookups, "must respect RELOOKUP_MIN_INTERVAL");
+
+		advance(SubscriptionClient.RELOOKUP_MIN_INTERVAL - 1);
+		assertEquals(lookupsAfterFirst, lookups);
+		advance(1);
+		assertEquals(lookupsAfterFirst + 1, lookups, "lookup fires as soon as RELOOKUP_MIN_INTERVAL elapses");
+	}
 }

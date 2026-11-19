@@ -523,6 +523,8 @@ public class RpcCall {
 	 * @throws IllegalStateException if expected RTT is not set
 	 */
 	protected void sent() {
+		if (state != State.UNSENT)
+			return;
 		if (expectedRTT <= 0)
 			throw new IllegalStateException("no expected RTT");
 

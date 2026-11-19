@@ -289,6 +289,8 @@ public class SubscriptionClient {
 		int token;
 		boolean confirmed;
 		boolean retokening;
+		int attempt;
+		RpcCall inFlightCall;
 		long renewTimer = -1;
 		// Where the storing node saw our SUBSCRIBE come from: the mapping its pushes go to.
 		InetSocketAddress observed;
@@ -316,6 +318,7 @@ public class SubscriptionClient {
 		private long lastLookupAt;
 		private boolean lookupPending;
 		private long lookupTimer = -1;
+		private long lookupTimerAt;
 		private long rehomeTimer = -1;
 		private long retryDelay = UNDERFILLED_RETRY_MIN;
 		private int reportedStatus;
@@ -552,8 +555,11 @@ public class SubscriptionClient {
 		watches.remove(watch.topic);
 		cancelTimer(watch.rehomeTimer);
 		cancelTimer(watch.lookupTimer);
+		watch.lookupTimer = -1;
 		for (Slot slot : watch.slots.values()) {
 			cancelTimer(slot.renewTimer);
+			slot.renewTimer = -1;
+			retireInFlight(slot);
 			if (tellNodes && slot.confirmed) {
 				Message request = Message.subscribeRequest(watch.topic.target(), watch.topic.kind(), 0, -1, 0);
 				host.send(new RpcCall(slot.node, request));
@@ -593,17 +599,29 @@ public class SubscriptionClient {
 
 	/**
 	 * Asks for a new lookup, now if the rate allows it, otherwise once it does.
+	 * If a farther retry timer is already armed, brings it forward to the earliest allowed time.
 	 */
 	private void requestLookup(Watch watch) {
-		if (watch.cancelled || watch.lookupPending || watch.lookupTimer != -1)
+		if (watch.cancelled || watch.lookupPending)
 			return;
 
-		long wait = watch.lastLookupAt + RELOOKUP_MIN_INTERVAL - host.now();
+		long now = host.now();
+		long desired = Math.max(now, watch.lastLookupAt + RELOOKUP_MIN_INTERVAL);
+		if (watch.lookupTimer != -1) {
+			if (watch.lookupTimerAt <= desired)
+				return;
+
+			cancelTimer(watch.lookupTimer);
+			watch.lookupTimer = -1;
+		}
+
+		long wait = desired - now;
 		if (wait <= 0) {
 			lookup(watch);
 			return;
 		}
 
+		watch.lookupTimerAt = desired;
 		watch.lookupTimer = host.setTimer(wait, () -> {
 			watch.lookupTimer = -1;
 			lookup(watch);
@@ -661,8 +679,10 @@ public class SubscriptionClient {
 		if (watch.cancelled || watch.lookupTimer != -1)
 			return;
 
-		long delay = Math.max(watch.retryDelay, watch.lastLookupAt + RELOOKUP_MIN_INTERVAL - host.now());
+		long now = host.now();
+		long delay = Math.max(watch.retryDelay, watch.lastLookupAt + RELOOKUP_MIN_INTERVAL - now);
 		watch.retryDelay = Math.min(watch.retryDelay * 2, REHOME_INTERVAL);
+		watch.lookupTimerAt = now + delay;
 		watch.lookupTimer = host.setTimer(delay, () -> {
 			watch.lookupTimer = -1;
 			lookup(watch);
@@ -674,11 +694,26 @@ public class SubscriptionClient {
 			fill(watch);
 	}
 
+	private static int retireInFlight(Slot slot) {
+		int next = ++slot.attempt;
+		RpcCall previous = slot.inFlightCall;
+		slot.inFlightCall = null;
+		if (previous != null)
+			previous.cancel();
+		return next;
+	}
+
 	private void send(Watch watch, Slot slot) {
+		send(watch, slot, false);
+	}
+
+	private void send(Watch watch, Slot slot, boolean retoken) {
+		int attempt = retireInFlight(slot);
 		int knownSeq = watch.topic.kind() == SubscriptionKind.VALUE ? watch.knownSeq : -1;
 		Message request = Message.subscribeRequest(watch.topic.target(), watch.topic.kind(), slot.token, knownSeq,
 				REQUESTED_LEASE);
 
+		boolean[] settled = new boolean[] { false };
 		RpcCall call = new RpcCall(slot.node, request).addListener(new RpcCallListener() {
 			@Override
 			public void onStateChange(RpcCall c, RpcCall.State previous, RpcCall.State state) {
@@ -686,21 +721,63 @@ public class SubscriptionClient {
 
 			@Override
 			public void onResponse(RpcCall c) {
+				if (settled[0] || slot.attempt != attempt)
+					return;
+
+				settled[0] = true;
+				slot.inFlightCall = null;
+				if (retoken)
+					slot.retokening = false;
 				accepted(watch, slot, c.getResponse().getBody(), c.getResponse().getObserved());
 			}
 
 			@Override
 			public void onError(RpcCall c) {
-				rejected(watch, slot, c.getCause());
+				if (settled[0] || slot.attempt != attempt)
+					return;
+
+				settled[0] = true;
+				slot.inFlightCall = null;
+				if (retoken)
+					slot.retokening = false;
+				rejected(watch, slot, c.getCause(), retoken);
 			}
 
 			@Override
 			public void onTimeout(RpcCall c) {
-				rejected(watch, slot, null);
+				if (settled[0] || slot.attempt != attempt)
+					return;
+
+				settled[0] = true;
+				slot.inFlightCall = null;
+				if (retoken)
+					slot.retokening = false;
+				rejected(watch, slot, null, retoken);
+			}
+
+			@Override
+			public void onCancel(RpcCall c) {
+				if (settled[0] || slot.attempt != attempt)
+					return;
+
+				settled[0] = true;
+				slot.inFlightCall = null;
+				if (retoken)
+					slot.retokening = false;
 			}
 		});
 
-		host.send(call).onFailure(e -> rejected(watch, slot, e));
+		slot.inFlightCall = call;
+		host.send(call).onFailure(e -> {
+			if (settled[0] || slot.attempt != attempt)
+				return;
+
+			settled[0] = true;
+			slot.inFlightCall = null;
+			if (retoken)
+				slot.retokening = false;
+			rejected(watch, slot, e, retoken);
+		});
 	}
 
 	private void accepted(Watch watch, Slot slot, SubscribeResponse response, InetSocketAddress observed) {
@@ -732,14 +809,15 @@ public class SubscriptionClient {
 		watch.ready.tryComplete();
 	}
 
-	private void rejected(Watch watch, Slot slot, Throwable cause) {
+	private void rejected(Watch watch, Slot slot, Throwable cause, boolean retoken) {
 		if (watch.cancelled || watch.slots.get(slot.node.getId()) != slot)
 			return;
 
 		// A node that accepted us before and now refuses the token is not refusing us: the token is bound to
 		// the endpoint it was issued for, and ours has moved - a NAT rebinding. Keep the node, fetch a token
-		// for where we are now.
-		if (cause instanceof InvalidTokenException && slot.confirmed) {
+		// for where we are now. If this was already the replacement SUBSCRIBE from retoken(), fall through
+		// to drop without exclusion so a persistently invalid token cannot loop.
+		if (cause instanceof InvalidTokenException && slot.confirmed && !retoken) {
 			retoken(watch, slot);
 			return;
 		}
@@ -772,32 +850,52 @@ public class SubscriptionClient {
 			return;
 
 		slot.retokening = true;
+		cancelTimer(slot.renewTimer);
+		slot.renewTimer = -1;
+		// Retire any renewal already in flight so its late timeout or error cannot drop the repaired slot.
+		int attempt = retireInFlight(slot);
+
+		boolean[] settled = new boolean[] { false };
 		Message request = Message.findNodeRequest(watch.topic.target(), false, false, true);
 		RpcCall call = new RpcCall(slot.node, request).addListener(new RpcCallListener() {
 			@Override
 			public void onStateChange(RpcCall c, RpcCall.State previous, RpcCall.State state) {
-				if (state.isFinal())
-					slot.retokening = false;
 			}
 
 			@Override
 			public void onResponse(RpcCall c) {
-				if (watch.cancelled || watch.slots.get(slot.node.getId()) != slot)
+				if (settled[0] || slot.attempt != attempt)
 					return;
+
+				settled[0] = true;
+				slot.inFlightCall = null;
+				if (watch.cancelled || watch.slots.get(slot.node.getId()) != slot) {
+					slot.retokening = false;
+					return;
+				}
 
 				int token = c.getResponse().<FindNodeResponse>getBody().getToken();
 				if (token == 0) {
+					slot.retokening = false;
 					drop(watch, slot, EXCLUDE_FAILED, true);
 					replace(watch);
 					return;
 				}
 
 				slot.token = token;
-				send(watch, slot);
+				// Stay guarded through the replacement SUBSCRIBE so keepalives do not overlap before
+				// accepted() confirms the new endpoint and updates slot.observed.
+				send(watch, slot, true);
 			}
 
 			@Override
 			public void onError(RpcCall c) {
+				if (settled[0] || slot.attempt != attempt)
+					return;
+
+				settled[0] = true;
+				slot.inFlightCall = null;
+				slot.retokening = false;
 				if (!watch.cancelled && watch.slots.get(slot.node.getId()) == slot) {
 					drop(watch, slot, EXCLUDE_FAILED, true);
 					replace(watch);
@@ -808,9 +906,25 @@ public class SubscriptionClient {
 			public void onTimeout(RpcCall c) {
 				onError(c);
 			}
+
+			@Override
+			public void onCancel(RpcCall c) {
+				if (settled[0] || slot.attempt != attempt)
+					return;
+
+				settled[0] = true;
+				slot.inFlightCall = null;
+				slot.retokening = false;
+			}
 		});
 
+		slot.inFlightCall = call;
 		host.send(call).onFailure(e -> {
+			if (settled[0] || slot.attempt != attempt)
+				return;
+
+			settled[0] = true;
+			slot.inFlightCall = null;
 			slot.retokening = false;
 			if (!watch.cancelled && watch.slots.get(slot.node.getId()) == slot) {
 				drop(watch, slot, EXCLUDE_FAILED, true);
@@ -838,6 +952,8 @@ public class SubscriptionClient {
 	private void drop(Watch watch, Slot slot, long exclude, boolean quiet) {
 		watch.slots.remove(slot.node.getId());
 		cancelTimer(slot.renewTimer);
+		slot.renewTimer = -1;
+		retireInFlight(slot);
 		if (exclude > 0)
 			watch.excluded.put(slot.node.getId(), host.now() + exclude);
 		if (!quiet && slot.confirmed) {
@@ -870,6 +986,7 @@ public class SubscriptionClient {
 			if (ar.succeeded() && !ar.result().isEmpty()) {
 				watch.candidates = ar.result();
 				watch.candidatesAt = host.now();
+				watch.excluded.values().removeIf(until -> until <= watch.candidatesAt);
 
 				// The nodes we would choose now; any other we hold is let go.
 				Set<Id> wanted = new HashSet<>();
@@ -878,7 +995,8 @@ public class SubscriptionClient {
 					if (wanted.size() >= SUBSCRIBE_NODES)
 						break;
 					NodeInfo node = candidate.node();
-					if (candidate.token() == 0 || watch.excluded.containsKey(node.getId()) || node.getIpAddress() == null)
+					if (candidate.token() == 0 || !supportsSubscriptions(candidate.version()) ||
+							watch.excluded.containsKey(node.getId()) || node.getIpAddress() == null)
 						continue;
 					if (units.add(SourceKey.of(node.getIpAddress())))
 						wanted.add(node.getId());
