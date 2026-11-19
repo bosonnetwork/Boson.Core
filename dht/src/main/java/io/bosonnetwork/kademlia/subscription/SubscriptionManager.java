@@ -636,9 +636,10 @@ public class SubscriptionManager {
 		sub.inFlight = false;
 		sub.inFlightSince = -1;
 		RpcCall call = sub.inFlightCall;
-		sub.inFlightCall = null;
-		if (call != null)
+		if (call != null) {
+			sub.inFlightCall = null;
 			call.cancel();
+		}
 	}
 
 	private void remove(Subscription sub) {

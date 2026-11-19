@@ -697,9 +697,10 @@ public class SubscriptionClient {
 	private static int retireInFlight(Slot slot) {
 		int next = ++slot.attempt;
 		RpcCall previous = slot.inFlightCall;
-		slot.inFlightCall = null;
-		if (previous != null)
+		if (previous != null) {
+			slot.inFlightCall = null;
 			previous.cancel();
+		}
 		return next;
 	}
 

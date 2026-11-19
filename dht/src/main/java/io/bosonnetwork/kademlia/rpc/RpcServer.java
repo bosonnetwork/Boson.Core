@@ -1335,6 +1335,13 @@ public class RpcServer implements Measured {
 					*/
 				}
 			});
+		}, e -> {
+			if (refundOutboundOnSkip) {
+				RpcCall associated = message.getAssociatedCall();
+				if (associated != null)
+					outboundThrottle.decrement(associated.getTarget().getIpAddress());
+			}
+			return Future.failedFuture(e);
 		});
 	}
 
