@@ -200,7 +200,7 @@ public class RpcServer implements Measured {
 	 * timer that would release it does not survive the context being torn down.
 	 * </p>
 	 */
-	private final Map<Long, RpcCall> delayedCalls;
+	private final Map<RpcCall, Long> delayedCalls;
 
 	/** Number of calls in flight that inbound traffic, rather than this node, asked for. */
 	private int unsolicitedCalls;
@@ -696,11 +696,11 @@ public class RpcServer implements Measured {
 			// is not set until it leaves the queue, and the timer that would release it into the socket goes
 			// down with the context. Cancel the release timer as well, or a stopped server can still hand a
 			// call to a socket that is gone.
-			List<Map.Entry<Long, RpcCall>> parked = new ArrayList<>(delayedCalls.entrySet());
+			List<Map.Entry<RpcCall, Long>> parked = new ArrayList<>(delayedCalls.entrySet());
 			delayedCalls.clear();
-			for (Map.Entry<Long, RpcCall> entry : parked) {
-				context.cancelTimer(entry.getKey());
-				entry.getValue().cancel();
+			for (Map.Entry<RpcCall, Long> entry : parked) {
+				context.cancelTimer(entry.getValue());
+				entry.getKey().cancel();
 			}
 
 			// Every listener above has run by now, so the counter is settling to zero rather than being
@@ -1083,6 +1083,9 @@ public class RpcServer implements Measured {
 	 * @return a Future resolving to the sent RpcCall
 	 */
 	public Future<RpcCall> sendCall(RpcCall call) {
+		if (!call.isPending())
+			return Future.succeededFuture(call);
+
 		if (call.isUnsolicited()) {
 			if (unsolicitedCalls >= maxUnsolicitedCalls)
 				return reject(call, CallRejectedException.Reason.UNSOLICITED_BUDGET, "Unsolicited call budget exceeded");
@@ -1095,8 +1098,8 @@ public class RpcServer implements Measured {
 		}
 
 		// One listener for everything this server has to give back when a call reaches a final state:
-		// answered, timed out, refused, cancelled by stop(). Every path out of a call passes through
-		// here, which is what keeps a slot from leaking per path that forgets it.
+		// answered, timed out, refused, cancelled by caller or stop(). Every path out of a call passes
+		// through here, which is what keeps a slot from leaking per path that forgets it.
 		call.addListener(new RpcCallListener() {
 			@Override
 			public void onStateChange(RpcCall c, RpcCall.State previous, RpcCall.State state) {
@@ -1105,6 +1108,14 @@ public class RpcServer implements Measured {
 
 				if (c.isUnsolicited())
 					unsolicitedCalls--;
+
+				// If the call was parked behind the outbound throttle, unpark it immediately so its
+				// slot is released and its timer will not dispatch a cancelled call later.
+				Long timerId = delayedCalls.remove(c);
+				if (timerId != null) {
+					context.cancelTimer(timerId);
+					outboundThrottle.decrement(c.getTarget().getIpAddress());
+				}
 
 				// Whoever removes the call from the pending map owns what follows. The inbound paths
 				// remove before they drive the call to its final state, and so does the send-failure
@@ -1150,6 +1161,9 @@ public class RpcServer implements Measured {
 	 * @return a Future resolving to the sent RpcCall
 	 */
 	private Future<RpcCall> dispatchCall(RpcCall call) {
+		if (!call.isPending())
+			return Future.succeededFuture(call);
+
 		// Parked calls count too. They are not in flight, but they hold their caller's slot exactly as if
 		// they were - a task keeps one of its alpha requests on a call that has not been sent - and leaving
 		// them out of the ceiling is what let the queue grow without one.
@@ -1181,15 +1195,16 @@ public class RpcServer implements Measured {
 			log.debug("Throttled (delay {}ms) the RPC call to remote peer {}@{}, {}",
 					delay, call.getTargetId(), call.getTarget().getHost(), call.getRequest());
 
-			// The handler is given its own timer id, so the parked call can find itself in the map without
-			// anything being captured but the call. The put runs before the handler can: this is the event
-			// loop, and the delay is positive.
+			// The put runs before the handler can: this is the event loop, and the delay is positive.
+			// Keyed by call so cancelling a parked call can unpark it and cancel its timer in O(1).
 			long timerId = context.setTimer(delay, id -> {
-				delayedCalls.remove(id);
-				outboundThrottle.decrement(call.getTarget().getIpAddress());
-				dispatchCall(call);
+				if (delayedCalls.remove(call, id)) {
+					outboundThrottle.decrement(call.getTarget().getIpAddress());
+					if (call.isPending())
+						dispatchCall(call);
+				}
 			});
-			delayedCalls.put(timerId, call);
+			delayedCalls.put(call, timerId);
 
 			if (metrics != null)
 				metrics.throttledOutbound(call.getTarget().getHost(), delay);
@@ -1202,8 +1217,13 @@ public class RpcServer implements Measured {
 				.setTimer(context);
 
 		pendingCalls.put(call.getTxid(), call);
-		return sendMessage(call.getRequest()).andThen(ar -> {
+		return sendMessage(call.getRequest(), true).andThen(ar -> {
 			if (ar.succeeded()) {
+				// The call may have been cancelled (or already settled) while encoding or sending ran
+				// asynchronously; do not move a final call back to SENT or report it as sent.
+				if (!call.isPending())
+					return;
+
 				call.sent();
 				// A liveness-neutral call reports none of this - see RpcCall#setLivenessNeutral. Its failure
 				// is expected to say something about a NAT mapping rather than about the target or us.
@@ -1231,7 +1251,7 @@ public class RpcServer implements Measured {
 				// The exemption now lives in handlePacket, where a packet can actually be shown to be an
 				// answer to one of our calls - see the refund there.
 			} else {
-				pendingCalls.remove(call.getTxid());
+				pendingCalls.remove(call.getTxid(), call);
 				call.fail(ar.cause());
 			}
 		}).map(call);
@@ -1244,6 +1264,10 @@ public class RpcServer implements Measured {
 	 * @return a Future that completes when the message is sent
 	 */
 	public Future<Void> sendMessage(Message message) {
+		return sendMessage(message, false);
+	}
+
+	private Future<Void> sendMessage(Message message, boolean refundOutboundOnSkip) {
 		message.setId(identity.getId());
 
 		// Every reply tells the requester the endpoint its request came from - which, behind NAT or an
@@ -1264,6 +1288,18 @@ public class RpcServer implements Measured {
 			// Not necessarily the message that was passed in: an oversized response is replaced by an
 			// error, and everything below reports what actually went on the wire.
 			Message sent = datagram.message();
+			RpcCall associated = sent.getAssociatedCall();
+			if (associated != null && !associated.isPending()) {
+				if (refundOutboundOnSkip)
+					outboundThrottle.decrement(associated.getTarget().getIpAddress());
+				return Future.succeededFuture();
+			}
+			if (socket == null) {
+				if (refundOutboundOnSkip && associated != null)
+					outboundThrottle.decrement(associated.getTarget().getIpAddress());
+				return Future.failedFuture(new IllegalStateException("RPC server is not running"));
+			}
+
 			Buffer buffer = datagram.buffer();
 			SocketAddress remote = sent.getRemoteAddress();
 			return socket.send(buffer, remote.port(), remote.host()).andThen(ar -> {

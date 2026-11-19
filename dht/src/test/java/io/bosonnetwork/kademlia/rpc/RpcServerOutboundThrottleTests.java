@@ -30,6 +30,8 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.TimeUnit;
 
 import io.vertx.core.Context;
@@ -309,6 +311,139 @@ public class RpcServerOutboundThrottleTests {
 					assertEquals(0, server.unsolicitedCallCount(),
 							"the budget must be given back as the calls settle")
 			)).onComplete(context.succeedingThenComplete());
+		}).onFailure(context::failNow));
+	}
+
+	/**
+	 * Cancelling a call parked behind the outbound throttle immediately removes it from the delay queue,
+	 * cancels its release timer, and prevents it from ever being dispatched.
+	 */
+	@Test
+	@Timeout(value = 30, timeUnit = TimeUnit.SECONDS)
+	void testCancelUnparksADelayedCallAndFreesItsSlot(Vertx vertx, VertxTestContext context) {
+		Context vertxContext = vertx.getOrCreateContext();
+		RpcServer server = newServer(vertxContext, 39208);
+		NodeInfo target = deadTarget(39298);
+
+		RpcCall parked = callTo(target).setUnsolicited(true);
+		boolean[] sentCallbackSawParked = new boolean[] { false };
+		server.setCallSentHandler(c -> {
+			if (c == parked)
+				sentCallbackSawParked[0] = true;
+		});
+
+		vertxContext.runOnContext(unused -> server.start().onSuccess(v -> {
+			for (int i = 0; i < OUTBOUND_BURST; i++)
+				server.sendCall(callTo(target));
+
+			server.sendCall(parked);
+			context.verify(() -> {
+				assertEquals(1, server.delayedCallCount(), "precondition: call is parked");
+				assertEquals(1, server.unsolicitedCallCount());
+			});
+
+			parked.cancel();
+			context.verify(() -> {
+				assertEquals(RpcCall.State.CANCELED, parked.getState());
+				assertEquals(0, server.delayedCallCount(), "cancelling a parked call must free its slot at once");
+				assertEquals(0, server.unsolicitedCallCount());
+			});
+
+			// Wait past the throttle release delay to ensure the cancelled call is never dispatched.
+			vertx.timer(1500).compose(t -> {
+				context.verify(() -> {
+					assertEquals(RpcCall.State.CANCELED, parked.getState(),
+							"cancelled parked call must remain CANCELED");
+					assertFalse(sentCallbackSawParked[0], "cancelled parked call must never be dispatched");
+				});
+				return server.stop();
+			}).onComplete(context.succeedingThenComplete());
+		}).onFailure(context::failNow));
+	}
+
+	/**
+	 * Cancelling a call while its asynchronous encode/send is still running must free its slot at once and
+	 * never allow the send completion to move the cancelled call back to SENT.
+	 */
+	@Test
+	@Timeout(value = 30, timeUnit = TimeUnit.SECONDS)
+	void testCancelDuringAsyncSendDoesNotMoveCallBackToSent(Vertx vertx, VertxTestContext context) {
+		Context vertxContext = vertx.getOrCreateContext();
+		RpcServer server = newServer(vertxContext, 39209);
+		NodeInfo target = deadTarget(39299);
+
+		RpcCall call = callTo(target).setUnsolicited(true);
+		boolean[] sentCallbackSawCall = new boolean[] { false };
+		boolean[] movedBackToSent = new boolean[] { false };
+		server.setCallSentHandler(c -> {
+			if (c == call)
+				sentCallbackSawCall[0] = true;
+		});
+		call.addListener(new RpcCallListener() {
+			@Override
+			public void onStateChange(RpcCall c, RpcCall.State previous, RpcCall.State state) {
+				if (previous == RpcCall.State.CANCELED && state == RpcCall.State.SENT)
+					movedBackToSent[0] = true;
+			}
+		});
+
+		vertxContext.runOnContext(unused -> server.start().onSuccess(v -> {
+			Future<RpcCall> sending = server.sendCall(call);
+			// Cancel immediately on the same event-loop turn while encode/send is in flight asynchronously.
+			call.cancel();
+
+			context.verify(() -> {
+				assertEquals(RpcCall.State.CANCELED, call.getState());
+				assertFalse(server.hasPendingCalls(), "cancelling must remove the call from pendingCalls at once");
+				assertEquals(0, server.unsolicitedCallCount());
+			});
+
+			sending.compose(ignored -> vertx.timer(200)).compose(t -> {
+				context.verify(() -> {
+					assertEquals(RpcCall.State.CANCELED, call.getState(),
+							"async send completion must not move a cancelled call back to SENT");
+					assertFalse(movedBackToSent[0], "cancelled call transitioned back to SENT");
+					assertFalse(sentCallbackSawCall[0], "cancelled call must not be reported as sent");
+					assertFalse(server.hasPendingCalls());
+					assertEquals(0, server.unsolicitedCallCount());
+				});
+				return server.stop();
+			}).onComplete(context.succeedingThenComplete());
+		}).onFailure(context::failNow));
+	}
+
+	/**
+	 * Cancelling an admitted call while it is encoding skips the socket write and must refund its
+	 * outbound-throttle charge so subsequent traffic to the same destination is not delayed.
+	 */
+	@Test
+	@Timeout(value = 30, timeUnit = TimeUnit.SECONDS)
+	void testCancelDuringEncodeRefundsOutboundThrottleCapacity(Vertx vertx, VertxTestContext context) {
+		Context vertxContext = vertx.getOrCreateContext();
+		RpcServer server = newServer(vertxContext, 39210);
+		NodeInfo target = deadTarget(39300);
+
+		vertxContext.runOnContext(unused -> server.start().onSuccess(v -> {
+			// Spend the entire burst, cancelling every call on the same event-loop turn before encode() can
+			// deliver its result back to the loop and reach socket.send().
+			List<Future<RpcCall>> cancelledSends = new ArrayList<>(OUTBOUND_BURST);
+			for (int i = 0; i < OUTBOUND_BURST; i++) {
+				RpcCall call = callTo(target);
+				cancelledSends.add(server.sendCall(call));
+				call.cancel();
+			}
+
+			Future.all(cancelledSends).compose(ignored -> {
+				// All pre-write skips have run and refunded their throttle charges: a full fresh burst to the
+				// same target should go through without parking.
+				for (int i = 0; i < OUTBOUND_BURST; i++)
+					server.sendCall(callTo(target));
+
+				int parked = server.delayedCallCount();
+				context.verify(() -> assertEquals(0, parked,
+						"cancelled pre-write calls must refund outbound throttle capacity"));
+				return server.stop();
+			}).onComplete(context.succeedingThenComplete());
 		}).onFailure(context::failNow));
 	}
 }

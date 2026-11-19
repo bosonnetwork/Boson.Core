@@ -63,6 +63,8 @@ class SubscriptionManagerTests {
 	private Map<Id, List<PeerInfo>> peers;
 	// Decides, per call, whether the RPC server refuses it: null to send, a reason to refuse.
 	private Function<RpcCall, CallRejectedException.Reason> refuse;
+	// When true, Host.send leaves calls in UNSENT to simulate parking behind the outbound throttle.
+	private boolean parkCalls;
 	private SubscriptionManager manager;
 
 	private final Id subscriber = Id.random();
@@ -79,6 +81,7 @@ class SubscriptionManagerTests {
 		values = new HashMap<>();
 		peers = new HashMap<>();
 		refuse = call -> null;
+		parkCalls = false;
 		owner = Signature.KeyPair.random();
 		valueId = Id.of(owner.publicKey().bytes());
 
@@ -92,8 +95,11 @@ class SubscriptionManagerTests {
 			public Future<RpcCall> send(RpcCall call) {
 				sent.add(call);
 				CallRejectedException.Reason reason = refuse.apply(call);
-				if (reason == null)
+				if (reason == null) {
+					if (!parkCalls)
+						markSent(call);
 					return Future.succeededFuture(call);
+				}
 
 				// As RpcServer.reject does it: the call fails first, synchronously, then the future.
 				CallRejectedException cause = new CallRejectedException(reason, "refused");
@@ -149,6 +155,10 @@ class SubscriptionManagerTests {
 		} catch (Exception e) {
 			throw new RuntimeException(name + " failed", e);
 		}
+	}
+
+	private static void markSent(RpcCall call) {
+		invoke(call, "updateState", RpcCall.State.class, RpcCall.State.SENT);
 	}
 
 	private static void ack(RpcCall call) {
@@ -364,6 +374,7 @@ class SubscriptionManagerTests {
 		advance(SubscriptionManager.PUSH_MIN_INTERVAL);
 		InetSocketAddress moved = new InetSocketAddress("12.34.56.78", 40000);
 		manager.subscribe(subscriber, moved, SubscriptionKind.VALUE, valueId, -1, -1);
+		assertEquals(RpcCall.State.CANCELED, stale.getState(), "abandoned push is cancelled to free its RPC slot");
 		assertEquals(2, sent.size(), "pushed again without waiting for the old push to time out");
 		assertEquals(moved, last().getTarget().getAddress());
 
@@ -418,11 +429,79 @@ class SubscriptionManagerTests {
 
 		advance(SubscriptionManager.PUSH_MIN_INTERVAL);
 		manager.heardFrom(subscriber, address);
+		assertEquals(RpcCall.State.CANCELED, retry.getState(), "superseded retry is cancelled to free its RPC slot");
 		assertEquals(3, sent.size(), "the retry in flight is resent now the path is open");
 		timeout(retry);
 		assertEquals(1, manager.get(subscriber, SubscriptionKind.VALUE, valueId).failures,
 				"the abandoned retry's timeout counts for nothing");
 		assertEquals(2, seqOf(last()), "and what goes out is the newest version");
+	}
+
+	@Test
+	void testHeardFromDoesNotAbandonAFreshlySentRetry() throws Exception {
+		manager.subscribe(subscriber, address, SubscriptionKind.VALUE, valueId, -1, -1);
+		manager.valueStored(value(1));
+		timeout(last());
+		advance(SubscriptionManager.PUSH_MIN_INTERVAL);
+		RpcCall retry = last();
+		assertEquals(2, sent.size());
+
+		// A packet arriving shortly after the retry left must not abandon it before RESEND_WHEN_HEARD_AFTER.
+		advance(100);
+		manager.heardFrom(subscriber, address);
+		assertEquals(2, sent.size());
+		assertEquals(RpcCall.State.SENT, retry.getState(), "freshly sent retry must not be cancelled");
+
+		// Once RESEND_WHEN_HEARD_AFTER has elapsed, heardFrom resends once and protects the new resend.
+		advance(SubscriptionManager.RESEND_WHEN_HEARD_AFTER);
+		manager.heardFrom(subscriber, address);
+		assertEquals(RpcCall.State.CANCELED, retry.getState());
+		assertEquals(3, sent.size());
+		RpcCall resend = last();
+
+		// A second packet immediately after the resend must not abandon it while failures > 0.
+		advance(10);
+		manager.heardFrom(subscriber, address);
+		assertEquals(3, sent.size());
+		assertEquals(RpcCall.State.SENT, resend.getState());
+
+		ack(resend);
+		assertEquals(0, manager.get(subscriber, SubscriptionKind.VALUE, valueId).failures);
+		assertNull(manager.get(subscriber, SubscriptionKind.VALUE, valueId).pendingValue);
+	}
+
+	@Test
+	void testHeardFromStartsResendWindowAtActualDispatchNotPush() throws Exception {
+		manager.subscribe(subscriber, address, SubscriptionKind.VALUE, valueId, -1, -1);
+
+		// Simulate the RPC server parking the notification behind its outbound throttle (stays UNSENT).
+		parkCalls = true;
+		manager.valueStored(value(1));
+		assertEquals(1, sent.size());
+		RpcCall parked = last();
+		assertEquals(RpcCall.State.UNSENT, parked.getState());
+
+		// Waiting longer than RESEND_WHEN_HEARD_AFTER while parked must not cancel or resend an unsent call.
+		advance(SubscriptionManager.RESEND_WHEN_HEARD_AFTER * 2);
+		manager.heardFrom(subscriber, address);
+		assertEquals(1, sent.size(), "heardFrom must leave a parked call alone");
+		assertEquals(RpcCall.State.UNSENT, parked.getState());
+
+		// The call finally leaves the socket: the resend window starts now, not when push() queued it.
+		markSent(parked);
+		advance(50);
+		manager.heardFrom(subscriber, address);
+		assertEquals(1, sent.size(), "a call dispatched 50ms ago must not be cancelled");
+		assertEquals(RpcCall.State.SENT, parked.getState());
+
+		// Once RESEND_WHEN_HEARD_AFTER elapses after actual dispatch, heardFrom resends as expected.
+		parkCalls = false;
+		advance(SubscriptionManager.RESEND_WHEN_HEARD_AFTER);
+		manager.heardFrom(subscriber, address);
+		assertEquals(RpcCall.State.CANCELED, parked.getState());
+		assertEquals(2, sent.size());
+		ack(last());
+		assertNull(manager.get(subscriber, SubscriptionKind.VALUE, valueId).pendingValue);
 	}
 
 	@Test
@@ -599,7 +678,7 @@ class SubscriptionManagerTests {
 		int acked = 0;
 		while (acked < sent.size()) {
 			RpcCall call = sent.get(acked++);
-			if (call.getState() == RpcCall.State.UNSENT)
+			if (call.isPending())
 				ack(call);
 		}
 	}
